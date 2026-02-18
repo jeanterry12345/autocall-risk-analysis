@@ -123,23 +123,12 @@ def delta_profile(
 
     deltas = []
     original_S0 = product.S0
-    original_ac = product.autocall_barrier
-    original_cp = product.coupon_barrier
-    original_ki = product.ki_barrier
 
     for S in spot_range:
-        ratio = S / original_S0
         product.S0 = S
-        product.autocall_barrier = original_ac * ratio
-        product.coupon_barrier = original_cp * ratio
-        product.ki_barrier = original_ki * ratio
-
         d = delta(product, n_paths=n_paths, seed=seed)
         deltas.append(d)
 
     product.S0 = original_S0
-    product.autocall_barrier = original_ac
-    product.coupon_barrier = original_cp
-    product.ki_barrier = original_ki
 
     return {"spots": spot_range, "deltas": np.array(deltas)}

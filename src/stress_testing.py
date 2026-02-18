@@ -59,17 +59,21 @@ def stress_test(
         S0=new_S0, sigma=new_sigma, n_paths=n_paths, seed=seed
     )
 
+    vol_model = getattr(product, "vol_model", None)
+    if vol_model is not None and hasattr(vol_model, "shift"):
+        vol_model = vol_model.shift(vol_shock)
     stressed_full = Autocallable(
         S0=new_S0,
-        autocall_barrier=product.autocall_barrier / product.S0,
-        coupon_barrier=product.coupon_barrier / product.S0,
-        ki_barrier=product.ki_barrier / product.S0,
+        autocall_barrier=product.autocall_barrier / new_S0,
+        coupon_barrier=product.coupon_barrier / new_S0,
+        ki_barrier=product.ki_barrier / new_S0,
         coupon_rate=product.coupon_rate,
         n_observations=product.n_observations,
         T=product.T,
         r=product.r,
         sigma=new_sigma,
         notional=product.notional,
+        vol_model=vol_model,
     )
     stressed_detail = stressed_full.price(n_paths=n_paths, seed=seed)
 

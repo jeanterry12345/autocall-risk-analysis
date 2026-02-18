@@ -124,11 +124,6 @@ def multi_day_pnl(
         product.sigma = vol_path[day]
         product.T = current_T - day / 365.0
 
-        ratio = spot_path[day] / current_S0
-        product.autocall_barrier = product.autocall_barrier
-        product.coupon_barrier = product.coupon_barrier
-        product.ki_barrier = product.ki_barrier
-
         attr = pnl_attribution(
             product, dS=dS, d_sigma=d_sigma, dt_days=1.0,
             n_paths=n_paths, seed=seed + day,
