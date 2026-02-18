@@ -146,10 +146,11 @@ class TestStressTesting:
         )
         assert result["pnl_impact"] < 0
 
-    def test_positive_market_increases_value(self, standard_autocall):
+    def test_vol_collapse_increases_value(self, standard_autocall):
+        """Vol collapse reduces KI risk → note value increases."""
         from src.stress_testing import stress_test
         result = stress_test(
-            standard_autocall, spot_shock=0.10, vol_shock=-0.05,
+            standard_autocall, spot_shock=0.05, vol_shock=-0.10,
             n_paths=50_000, seed=42,
         )
         assert result["pnl_impact"] > 0

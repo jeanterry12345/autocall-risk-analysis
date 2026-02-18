@@ -2,17 +2,28 @@
 Autocallable structured product pricing via Monte Carlo simulation.
 
 Product: Phoenix Autocallable Note
-- At each observation date: if S >= autocall_barrier -> early redemption + coupons
-- Coupon: paid if S >= coupon_barrier (memory feature: unpaid coupons accumulate)
+- At each observation date:
+  1. If S >= autocall_barrier -> early redemption (notional + pending memory coupons + current coupon)
+  2. Else if S >= coupon_barrier -> pay coupon (+ any accumulated memory coupons)
+  3. Else -> no coupon (accumulates in memory for next eligible date)
 - At maturity (if not autocalled):
   - If knock-in triggered (S ever < ki_barrier) and S_T < S0: capital loss
-  - Else: return notional + any accumulated coupons
+    (coupons already paid during life are kept by investor)
+  - Else: return notional (coupons already paid during life are kept)
 
 Reference: Hull Ch. 26 (Exotic Options).
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
 import numpy as np
-from .utils import simulate_gbm_paths, simulate_gbm_paths_antithetic
+
+from .utils import simulate_gbm_paths, simulate_gbm_paths_antithetic, simulate_paths_local_vol
+
+if TYPE_CHECKING:
+    from .local_vol import VolModel
 
 
 class Autocallable:
@@ -38,9 +49,12 @@ class Autocallable:
     r : float
         Risk-free rate (annualized).
     sigma : float
-        Volatility (annualized).
+        Volatility (annualized). Used when vol_model is None.
     notional : float
         Notional amount (default 100).
+    vol_model : VolModel, optional
+        Volatility model (ConstantVol, TermStructureVol, LocalVol).
+        If None, uses constant sigma (backwards compatible).
     """
 
     def __init__(
@@ -55,6 +69,7 @@ class Autocallable:
         r: float,
         sigma: float,
         notional: float = 100.0,
+        vol_model: Optional[VolModel] = None,
     ):
         self._validate_params(
             S0, autocall_barrier, coupon_barrier, ki_barrier, coupon_rate, T, r, sigma
@@ -69,6 +84,7 @@ class Autocallable:
         self.r = r
         self.sigma = sigma
         self.notional = notional
+        self.vol_model = vol_model
 
         self.observation_times = np.linspace(
             T / n_observations, T, n_observations
@@ -111,7 +127,13 @@ class Autocallable:
         n_steps = self.n_observations * n_steps_per_period
         obs_indices = [i * n_steps_per_period for i in range(1, self.n_observations + 1)]
 
-        if antithetic:
+        if self.vol_model is not None:
+            # Local vol / term structure: Euler-Maruyama simulation
+            # Antithetic variates not applicable (path-dependent vol)
+            paths = simulate_paths_local_vol(
+                self.S0, self.r, self.vol_model, self.T, n_steps, n_paths, seed
+            )
+        elif antithetic:
             paths = simulate_gbm_paths_antithetic(
                 self.S0, self.r, self.sigma, self.T, n_steps, n_paths, seed
             )
@@ -129,21 +151,38 @@ class Autocallable:
         path_min = np.min(paths, axis=0)
         ki_triggered = path_min < self.ki_barrier
 
+        # Memory coupon tracking: number of consecutive unpaid coupon periods
+        pending_coupons = np.zeros(n_paths, dtype=int)
+
         for i, obs_idx in enumerate(obs_indices):
             obs_time = self.observation_times[i]
             S_obs = paths[obs_idx]
-
-            can_autocall = (~autocalled) & (S_obs >= self.autocall_barrier)
-
-            n_coupons = i + 1
-            payoff_if_called = self.notional * (1 + self.coupon_rate * n_coupons)
             discount = np.exp(-self.r * obs_time)
+            alive = ~autocalled
 
-            payoffs[can_autocall] = payoff_if_called * discount
-            autocall_dates[can_autocall] = obs_time
-            autocalled[can_autocall] = True
-            autocall_counts[i] = np.sum(can_autocall)
+            # --- Autocall check ---
+            can_autocall = alive & (S_obs >= self.autocall_barrier)
+            if np.any(can_autocall):
+                # Pay notional + accumulated memory coupons + current coupon
+                n_cpn = pending_coupons[can_autocall] + 1
+                payoffs[can_autocall] += self.notional * (1 + self.coupon_rate * n_cpn) * discount
+                autocall_dates[can_autocall] = obs_time
+                autocalled[can_autocall] = True
+                autocall_counts[i] = np.sum(can_autocall)
 
+            # --- Coupon check (memory feature) for non-autocalled alive paths ---
+            still_alive = alive & ~can_autocall
+            cpn_paid = still_alive & (S_obs >= self.coupon_barrier)
+            cpn_missed = still_alive & (S_obs < self.coupon_barrier)
+
+            if np.any(cpn_paid):
+                n_cpn = pending_coupons[cpn_paid] + 1
+                payoffs[cpn_paid] += self.notional * self.coupon_rate * n_cpn * discount
+                pending_coupons[cpn_paid] = 0
+
+            pending_coupons[cpn_missed] += 1
+
+        # --- Terminal payoff for non-autocalled paths ---
         still_alive = ~autocalled
         S_T = paths[-1]
         discount_T = np.exp(-self.r * self.T)
@@ -151,8 +190,11 @@ class Autocallable:
         ki_loss = still_alive & ki_triggered & (S_T < self.S0)
         no_ki = still_alive & ~ki_loss
 
-        payoffs[ki_loss] = self.notional * (S_T[ki_loss] / self.S0) * discount_T
-        payoffs[no_ki] = self.notional * (1 + self.coupon_rate * self.n_observations) * discount_T
+        # KI loss: capital return only (coupons already paid in loop)
+        payoffs[ki_loss] += self.notional * (S_T[ki_loss] / self.S0) * discount_T
+
+        # No KI: full notional returned (coupons already paid in loop)
+        payoffs[no_ki] += self.notional * discount_T
 
         price_mean = np.mean(payoffs)
         price_std = np.std(payoffs) / np.sqrt(n_paths)
@@ -187,16 +229,24 @@ class Autocallable:
         Reprice with bumped parameters. Used by Greeks finite difference.
         Barriers remain fixed (set at inception), only spot/vol/rate/T change.
         Returns scalar price only.
+
+        When vol_model is set, bumping sigma creates a parallel-shifted
+        vol model (all implied vols shift by the same amount).
         """
         saved = {
             "S0": self.S0, "sigma": self.sigma,
             "r": self.r, "T": self.T,
             "obs_times": self.observation_times.copy(),
+            "vol_model": self.vol_model,
         }
 
         if S0 is not None:
             self.S0 = S0
         if sigma is not None:
+            if self.vol_model is not None and hasattr(self.vol_model, "shift"):
+                # Parallel shift the vol model
+                delta = sigma - self.sigma
+                self.vol_model = self.vol_model.shift(delta)
             self.sigma = sigma
         if r is not None:
             self.r = r
@@ -214,14 +264,16 @@ class Autocallable:
         self.r = saved["r"]
         self.T = saved["T"]
         self.observation_times = saved["obs_times"]
+        self.vol_model = saved["vol_model"]
 
         return price
 
     def description(self) -> str:
+        vol_info = self.vol_model.model_name if self.vol_model else f"σ={self.sigma:.1%}"
         return (
             f"Phoenix Autocallable | S0={self.S0:.0f} | "
             f"AC={self.autocall_barrier:.0f} ({self.autocall_barrier/self.S0:.0%}) | "
             f"KI={self.ki_barrier:.0f} ({self.ki_barrier/self.S0:.0%}) | "
             f"Coupon={self.coupon_rate:.1%}/period | "
-            f"T={self.T:.1f}y | σ={self.sigma:.1%}"
+            f"T={self.T:.1f}y | {vol_info}"
         )
